@@ -1,66 +1,147 @@
 import cv2
 import mediapipe as mp
+import pyautogui
+import time
+import math
 
-#Capture Video
+# ——— Configuration ———
+BLINK_COOLDOWN = 0.5  # seconds between blinks
+TOO_CLOSE = 150       # eye pixel distance threshold for being "too close"
+TOO_FAR   = 70        # eye pixel distance threshold for being "too far"
+SMOOTHING = 0.2       # cursor smoothing factor (0 < x < 1, higher is faster)
+
+# Face landmark index for the nose tip (used for head tracking)
+NOSE_TIP_ID = 1
+RIGHT_EYE_CENTER_ID = 468
+LEFT_EYE_CENTER_ID = 473
+
+# For blinking
+RIGHT_EYE_TOP = 159
+RIGHT_EYE_BOTTOM = 145
+LEFT_EYE_TOP = 386
+LEFT_EYE_BOTTOM = 374
+
+# ——— Setup ———
+pyautogui.FAILSAFE = False
+screen_w, screen_h = pyautogui.size()
 cap = cv2.VideoCapture(0)
-mp_face_mesh = mp.solutions.face_mesh.FaceMesh(static_image_mode=False, refine_landmarks=True)
 
+# Reduce resolution for speed
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+# MediaPipe FaceMesh with iris landmarks
+mp_face_mesh = mp.solutions.face_mesh.FaceMesh(refine_landmarks=True)
+
+# Trackers
+last_blink_r = last_blink_l = 0
+notified = None
+status_text = ""
+smoothed_x = screen_w // 2
+smoothed_y = screen_h // 2
+
+# Calibrate nose position on start
+calibrated_nose_x = None
+calibrated_nose_y = None
+CALIBRATION_FRAMES = 30
+calibration_count = 0
+sum_nose_x = 0
+sum_nose_y = 0
+
+# ——— Main Loop ———
 while True:
     ret, frame = cap.read()
-
-    if cv2.waitKey(1) == 27:  # Esc key
+    if not ret:
         break
-    
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
+    frame = cv2.flip(frame, 1)  # Mirror the camera
+    ih, iw = frame.shape[:2]
+
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = mp_face_mesh.process(rgb)
 
     if results.multi_face_landmarks:
-        for face_landmarks in results.multi_face_landmarks:
-            landmark_right = face_landmarks.landmark[468]
-            r_x_pixel = int(landmark_right.x * frame.shape[1])
-            r_y_pixel = int(landmark_right.y * frame.shape[0])
+        lm = results.multi_face_landmarks[0].landmark
 
-            cv2.circle(frame, (r_x_pixel, r_y_pixel), radius=2, color=(0, 255, 0), thickness=-1)
+        # — Distance Feedback (based on iris landmark distance)
+        rx, ry = int(lm[RIGHT_EYE_CENTER_ID].x * iw), int(lm[RIGHT_EYE_CENTER_ID].y * ih)
+        lx, ly = int(lm[LEFT_EYE_CENTER_ID].x * iw), int(lm[LEFT_EYE_CENTER_ID].y * ih)
+        eye_dist = math.hypot(rx - lx, ry - ly)
 
-            landmark_left = face_landmarks.landmark[473]
-            l_x_pixel = int(landmark_left.x * frame.shape[1])
-            l_y_pixel = int(landmark_left.y * frame.shape[0])
+        if eye_dist > TOO_CLOSE and notified != "close":
+            status_text, notified = "Too Close", "close"
+        elif eye_dist < TOO_FAR and notified != "far":
+            status_text, notified = "Too Far", "far"
+        elif TOO_FAR <= eye_dist <= TOO_CLOSE and notified != "ok":
+            status_text, notified = "Perfect Distance", "ok"
 
-            cv2.circle(frame, (l_x_pixel, l_y_pixel), radius=2, color=(0, 0, 255), thickness=-1)
+        # — Draw Eye Centers and Status Text
+        cv2.circle(frame, (rx, ry), 3, (0,255,0), -1)
+        cv2.circle(frame, (lx, ly), 3, (0,0,255), -1)
+        cv2.putText(frame, status_text, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
 
-            landmark_right_top = face_landmarks.landmark[159]
-            rt_x_pixel = int(landmark_right_top.x * frame.shape[1])
-            rt_y_pixel = int(landmark_right_top.y * frame.shape[0])
+        # — Blink Detection (adjusted for flipped cam)
+        # — Blink detection (corrected for flipped frame)
+        now = time.time()
 
-            landmark_right_bot = face_landmarks.landmark[145]
-            rb_x_pixel = int(landmark_right_bot.x * frame.shape[1])
-            rb_y_pixel = int(landmark_right_bot.y * frame.shape[0])
+        # Visual Right Eye (actually left eye in landmarks due to flip)
+        visual_right_top = int(lm[386].y * ih)
+        visual_right_bottom = int(lm[374].y * ih)
+        if abs(visual_right_top - visual_right_bottom) < 5 and now - last_blink_r > BLINK_COOLDOWN:
+            print("RIGHT CLICK")
+            last_blink_r = now
 
-            landmark_left_top = face_landmarks.landmark[386]
-            lt_x_pixel = int(landmark_left_top.x * frame.shape[1])
-            lt_y_pixel = int(landmark_left_top.y * frame.shape[0])
+        # Visual Left Eye (actually right eye in landmarks due to flip)
+        visual_left_top = int(lm[159].y * ih)
+        visual_left_bottom = int(lm[145].y * ih)
+        if abs(visual_left_top - visual_left_bottom) < 5 and now - last_blink_l > BLINK_COOLDOWN:
+            print("LEFT CLICK")
+            last_blink_l = now
 
-            landmark_left_bot = face_landmarks.landmark[374]
-            lb_x_pixel = int(landmark_left_bot.x * frame.shape[1])
-            lb_y_pixel = int(landmark_left_bot.y * frame.shape[0])
 
-            right_eye_dist = abs(rt_y_pixel - rb_y_pixel)
+        # — Head Tracking (using nose tip)
+        nose_x = lm[NOSE_TIP_ID].x
+        nose_y = lm[NOSE_TIP_ID].y
 
-            left_eye_dist = abs(lt_y_pixel - lb_y_pixel)
+        # — Calibration (average over first N frames)
+        if calibrated_nose_x is None:
+            sum_nose_x += nose_x
+            sum_nose_y += nose_y
+            calibration_count += 1
+            if calibration_count == CALIBRATION_FRAMES:
+                calibrated_nose_x = sum_nose_x / CALIBRATION_FRAMES
+                calibrated_nose_y = sum_nose_y / CALIBRATION_FRAMES
+                print("[INFO] Calibration complete")
+        else:
+            # Relative movement from calibrated center (adjusted sensitivity)
+            dx = nose_x - calibrated_nose_x
+            dy = nose_y - calibrated_nose_y
 
-            if right_eye_dist < 5:
-                print("RIGHT CLICK")
-            
-            if left_eye_dist < 5:
-                print("LEFT CLICK")
+            # Reverse x-axis (because of flip) and scale sensitivity
+            sensitivity_x = 2.5  # adjust to make movement cover full screen
+            sensitivity_y = 3.5
+            move_x = dx * screen_w * sensitivity_x
+            move_y = dy * screen_h * sensitivity_y
 
-    cv2.imshow("Webcam", frame)
-    
+            target_x = screen_w / 2 + move_x
+            target_y = screen_h / 2 + move_y
+
+            # Clamp inside screen
+            target_x = max(0, min(screen_w, target_x))
+            target_y = max(0, min(screen_h, target_y))
+
+            # Smooth movement
+            smoothed_x = smoothed_x * (1 - SMOOTHING) + target_x * SMOOTHING
+            smoothed_y = smoothed_y * (1 - SMOOTHING) + target_y * SMOOTHING
+
+            # Move cursor
+            pyautogui.moveTo(smoothed_x, smoothed_y)
+            print(f"Cursor at ({int(smoothed_x)}, {int(smoothed_y)})")
+
+    # — Webcam Output —
+    cv2.imshow("Head Tracker", frame)
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
 
 cap.release()
 cv2.destroyAllWindows()
-
-
-
-
